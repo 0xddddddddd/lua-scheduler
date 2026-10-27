@@ -683,7 +683,7 @@ gcc -g -DDEBUG -c lua_scheduler.c -o lua_scheduler.o
 
 ### 依赖
 
-- **Lua 5.1+**
+- **Lua 5.5+**
 - **libuv**（可选，用于定时器集成）
 - **C99 编译器**（GCC、Clang、MSVC）
 
