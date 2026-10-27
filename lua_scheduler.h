@@ -292,6 +292,23 @@ void lua_sched_resume(lua_sched_ctx* ctx);
  */
 int lua_sched_is_paused(lua_sched_ctx* ctx);
 
+/**
+ * lua_sched_is_all_done - Check if all scripts and threads have completed
+ * @ctx: Scheduler context
+ *
+ * Checks if the entire script execution has naturally completed by verifying:
+ * - Entry coroutine is dead (main script finished)
+ * - No user threads are running (uthreads == 0)
+ * - No threads in posted_threads queue
+ * - No threads in paused_threads queue
+ *
+ * This function is useful for determining when to cleanup or exit after
+ * running a script with lua_sched_run_file or lua_sched_run_string.
+ *
+ * Returns: 1 if all execution completed, 0 if still running
+ */
+int lua_sched_is_all_done(lua_sched_ctx* ctx);
+
 /* ============================================================================
  * Resume Context Access (for lua_resume parameter tracking)
  * ============================================================================ */
@@ -317,8 +334,6 @@ lua_State* lua_sched_get_resume_from(lua_sched_co_ctx* co_ctx);
  * Returns: Number of arguments (0 or positive)
  */
 int lua_sched_get_resume_nargs(lua_sched_co_ctx* co_ctx);
-
-int lua_sched_is_all_done(lua_sched_ctx* ctx);
 
 #ifdef __cplusplus
 }

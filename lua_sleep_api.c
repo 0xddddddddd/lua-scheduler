@@ -11,7 +11,7 @@ void lua_sched_sleep_resume(lua_sched_ctx* ctx, lua_sched_co_ctx* coctx)
         return;
     }
 
-    ctx->evs--;
+    //ctx->evs--;
 
     if (ctx->exited == 1) {
         return;
@@ -83,14 +83,16 @@ static int lua_sched_sleep(lua_State *L)
         return luaL_error(L, "sleep not supported");
     }
 
+    //coctx->is_utimer = 1;
     /* Suspend coroutine */
     coctx->co_status = LUA_SCHED_CO_SUSPENDED;
+
     /* Create the timer - this should post the coroutine back when it fires */
     ctx->event.data = ctx->data;
     ctx->event.handler = lua_sched_sleep_resume;
     ctx->event.create(ctx, coctx, delay_ms);
 
-    ctx->evs++;
+    //ctx->evs++;
 
     return lua_yield(L, 0);
 }

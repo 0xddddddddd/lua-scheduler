@@ -83,6 +83,7 @@ struct lua_sched_co_ctx_s
     unsigned                    co_status : 3;              /* current coroutine status */
     unsigned                    co_entry : 1;
     unsigned                    is_uthread : 1;             /* is user thread */
+    unsigned                    is_utimer : 1;              /* is user timer */
     unsigned                    is_wrap : 1;                /* is coroutine.wrap */
     unsigned                    waited_by_parent : 1;       /* waited by parent */
     unsigned                    propagate_error : 1;        /* propagate error to parent */

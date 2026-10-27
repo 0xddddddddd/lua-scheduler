@@ -241,6 +241,39 @@ int lua_sched_is_paused(lua_sched_ctx* ctx)
     return ctx->paused;
 }
 
+int lua_sched_is_all_done(lua_sched_ctx* ctx)
+{
+    if (ctx == NULL) {
+        return 1;
+    }
+
+    /* Check if entry coroutine is dead */
+    if (ctx->entry_co_ctx.co_status != LUA_SCHED_CO_DEAD) {
+        return 0;
+    }
+
+    /* Check if there are active user threads */
+    if (ctx->uthreads > 0) {
+        return 0;
+    }
+
+    /*if (list_count_nodes(ctx->co_ctx_bucket) > 0) {
+        return 0;
+    }*/
+
+    /* Check if there are threads in posted queue */
+    if (ctx->posted_threads != NULL) {
+        return 0;
+    }
+
+    /* Check if there are threads in paused queue */
+    if (ctx->paused_threads != NULL) {
+        return 0;
+    }
+
+    return 1;
+}
+
 /* ============================================================================
  * Scheduler Exit/Stop Control
  * ============================================================================ */
@@ -1468,28 +1501,4 @@ lua_sched_co_ctx* lua_sched_find_co_ctx(lua_sched_ctx* ctx, lua_State* L)
     }
 
     return NULL;
-}
-
-int lua_sched_is_all_done(lua_sched_ctx* ctx)
-{
-    if (ctx == NULL) {
-        return 1;
-    }
-
-    // 检查入口协程是否完成
-    if (ctx->entry_co_ctx.co_status != LUA_SCHED_CO_DEAD) {
-        return 0;
-    }
-
-    // 检查是否还有用户线程
-    if (ctx->uthreads > 0 || ctx->evs > 0) {
-        return 0;
-    }
-
-    // 检查队列是否为空
-    if (ctx->posted_threads != NULL || ctx->paused_threads != NULL) {
-        return 0;
-    }
-
-    return 1;
 }
