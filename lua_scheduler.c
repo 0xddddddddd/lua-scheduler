@@ -80,6 +80,8 @@ lua_sched_ctx* lua_sched_init(lua_State* L,
     ctx->event.data = event->data;
     ctx->event.create = event->create;
     ctx->event.handler = lua_sched_sleep_resume;
+    ctx->event.complete = event->complete;
+
     lua_main_set(L, ctx);
     /* Initialize Lua registry for coroutines */
     lua_sched_init_registry(L);
@@ -278,6 +280,7 @@ void lua_sched_paused_threads_cleanup(lua_sched_ctx* ctx)
         if (pos->co_ctx && pos->co_ctx->co_ref != LUA_NOREF) {
             lua_sched_del_co_ctx(ctx, pos->co_ctx);
         }
+        ctx->evs--;
         free(pos);
     }
     ctx->paused_threads = NULL;
@@ -298,6 +301,10 @@ void lua_sched_co_ctx_bucket_cleanup(lua_sched_ctx* ctx)
             // 释放协程引用
             if (node->co_ref != LUA_NOREF) {
                 lua_sched_del_co_ctx(ctx, node);
+            }
+
+            if (node->is_uthread) {
+                ctx->uthreads--;
             }
         }
     }
@@ -329,6 +336,13 @@ void lua_sched_force_stop(lua_sched_ctx* ctx)
     // 6. 清理 entry 协程
     if (ctx->entry_co_ctx.co_ref != LUA_NOREF) {
         lua_sched_del_co_ctx(ctx, &ctx->entry_co_ctx);
+    }
+
+    if (lua_sched_is_all_done(ctx)) {
+        if (ctx->event.complete) {
+            ctx->event.complete(ctx, ctx->data);
+        }
+        DLOG("All threads completed 2\n");
     }
 }
 
@@ -647,6 +661,12 @@ int lua_sched_run_posted_threads(lua_State* L, lua_sched_ctx* ctx)
         pt = ctx->posted_threads;
         if (pt == NULL) {
             DLOG("  No more threads in queue\n");
+            if (lua_sched_is_all_done(ctx)) {
+                if (ctx->event.complete) {
+                    ctx->event.complete(ctx, ctx->data);
+                }
+                DLOG("All threads completed 1\n");
+            }
             return 0;
         }
 
@@ -1215,14 +1235,16 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
 
     if (ctx->cur_co_ctx == NULL) {
         DLOG("ERROR: ctx->cur_co_ctx is NULL\n");
-        return SCHED_ERROR;
+        result = SCHED_ERROR;
+        goto done;
     }
 
     /* Check if scheduler is paused */
     if (ctx->paused) {
         DLOG("Scheduler is paused, suspending coroutine\n");
         ctx->cur_co_ctx->co_status = LUA_SCHED_CO_SUSPENDED;
-        return SCHED_PAUSED;
+        result = SCHED_PAUSED;
+        goto done;
     }
 
     if (ctx->cur_co_ctx->thread_spawn_yielded) {
@@ -1239,13 +1261,15 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
         if (ctx->paused) {
             DLOG("Scheduler paused during execution\n");
             ctx->cur_co_ctx->co_status = LUA_SCHED_CO_SUSPENDED;
-            return SCHED_PAUSED;
+            result = SCHED_PAUSED;
+            goto done;
         }
         orig_coctx = ctx->cur_co_ctx;
 
         if (orig_coctx->propagate_error) {
             orig_coctx->propagate_error = 0;
-            return lua_sched_handle_coroutine_error(ctx, L, orig_coctx, err, msg, &nrets);
+            result = lua_sched_handle_coroutine_error(ctx, L, orig_coctx, err, msg, &nrets);
+            goto done;
         }
 
         /* Save resume context before calling lua_resume */
@@ -1261,21 +1285,23 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
 
                 if (ctx->exited) {
                     ctx->cur_co_ctx = NULL;
-                    return SCHED_DONE;
+                    result = SCHED_DONE;
+                    goto done;
                 }
 
                 result = lua_sched_handle_coroutine_operation(L, ctx, &nrets);
                 if (result != SCHED_CONTINUE)
-                    return result;
+                    goto done;
                 continue;
             case LUA_OK:
                 result = lua_sched_handle_coroutine_success(ctx, L, &nrets);
                 if (result == SCHED_CONTINUE) {
                     continue;
                 } else if (result == SCHED_DONE) {
-                    return 0;
+                    result = 0;
+                    goto done;
                 } else {
-                    return result;
+                    goto done;
                 }
             case LUA_ERRRUN:
                 err = "runtime error";
@@ -1310,6 +1336,7 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
         }
     }
 
+done:
     return result;
 }
 
@@ -1441,4 +1468,28 @@ lua_sched_co_ctx* lua_sched_find_co_ctx(lua_sched_ctx* ctx, lua_State* L)
     }
 
     return NULL;
+}
+
+int lua_sched_is_all_done(lua_sched_ctx* ctx)
+{
+    if (ctx == NULL) {
+        return 1;
+    }
+
+    // 检查入口协程是否完成
+    if (ctx->entry_co_ctx.co_status != LUA_SCHED_CO_DEAD) {
+        return 0;
+    }
+
+    // 检查是否还有用户线程
+    if (ctx->uthreads > 0 || ctx->evs > 0) {
+        return 0;
+    }
+
+    // 检查队列是否为空
+    if (ctx->posted_threads != NULL || ctx->paused_threads != NULL) {
+        return 0;
+    }
+
+    return 1;
 }

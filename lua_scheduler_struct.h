@@ -41,6 +41,7 @@ typedef struct lua_sched_ctx_s              lua_sched_ctx;
 typedef void (lua_event_create)(lua_sched_ctx*, lua_sched_co_ctx*, uint64_t delay_ms);
 typedef void (lua_event_destroy)(lua_sched_ctx*);
 typedef void (lua_event_handler)(lua_sched_ctx*, lua_sched_co_ctx*);
+typedef void (lua_event_complete)(lua_sched_ctx*, void* data);
 
 /* Posted thread structure for thread queue */
 struct lua_sched_posted_thread_s
@@ -56,6 +57,7 @@ struct lua_sched_event_s
     void*                       data;                       /* user state for custom data */
     lua_event_create*           create;
     lua_event_handler*          handler;
+    lua_event_complete*         complete;
 };
 
 /* coroutine context structure */

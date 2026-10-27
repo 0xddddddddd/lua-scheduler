@@ -318,6 +318,8 @@ lua_State* lua_sched_get_resume_from(lua_sched_co_ctx* co_ctx);
  */
 int lua_sched_get_resume_nargs(lua_sched_co_ctx* co_ctx);
 
+int lua_sched_is_all_done(lua_sched_ctx* ctx);
+
 #ifdef __cplusplus
 }
 #endif
