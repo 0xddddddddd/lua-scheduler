@@ -33,6 +33,7 @@
 #define SCHED_CONTINUE 0
 #define SCHED_AGAIN 1
 #define SCHED_DONE 2
+#define SCHED_PAUSED 3
 #define SCHED_ERROR -1
 
 #ifndef DLOG
@@ -40,10 +41,13 @@
 #else
 #   define DLOG(...)
 #endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 /* Registry keys (as light userdata pointers) */
+extern char lua_sched_main_key;
 extern char lua_sched_coroutines_key;
 extern char lua_sched_co_ctx_key;
 extern char lua_sched_ctx_registry_key;
@@ -56,7 +60,11 @@ void lua_sched_attach_co_ctx_to_L(lua_State* L,
 lua_sched_ctx* lua_registry_get(lua_State* L);
 void lua_registry_set(lua_State* L, lua_sched_ctx* ctx);
 
+lua_sched_ctx* lua_main_get(lua_State* L);
+void lua_main_set(lua_State* L, lua_sched_ctx* ctx);
+
 #ifdef __cplusplus
 }
 #endif
+
 #endif

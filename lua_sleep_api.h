@@ -9,6 +9,7 @@
 #include "lua_scheduler_util.h"
 
 /* Inject thread API into Lua state */
-void ngx_http_lua_inject_sleep_api(lua_State *L);
+void lua_sched_inject_sleep_api(lua_State *L);
+void lua_sched_sleep_resume(lua_sched_ctx* ctx, lua_sched_co_ctx* coctx);
 
 #endif

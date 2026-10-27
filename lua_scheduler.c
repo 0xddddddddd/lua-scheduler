@@ -5,20 +5,28 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "lua_list.h"
 #include "lua_coroutine_api.h"
 #include "lua_uthread_api.h"
+#include "lua_sleep_api.h"
 
-/* Forward declarations */
+/* ============================================================================
+ * Forward Declarations
+ * ============================================================================ */
+
 static void lua_sched_init_registry(lua_State* L);
 static int lua_sched_atpanic(lua_State* L);
 static int lua_sched_thread_traceback(lua_State* L, lua_State* co);
-static void lua_sched_cleanup_zombie_child_threads(lua_State* L,
-                                                   lua_sched_ctx* ctx,
+static void lua_sched_cleanup_zombie_child_threads(lua_sched_ctx* ctx,
                                                    lua_sched_co_ctx* coctx);
 static int lua_sched_post_zombie_thread(lua_sched_co_ctx* parent,
                                         lua_sched_co_ctx* thread);
 
 static void lua_sched_finalize_threads(lua_sched_ctx* ctx, lua_State* L);
+
+/* ============================================================================
+ * Registry Initialization
+ * ============================================================================ */
 
 static void lua_sched_init_registry(lua_State* L)
 {
@@ -33,7 +41,9 @@ static void lua_sched_init_registry(lua_State* L)
     lua_rawset(L, LUA_REGISTRYINDEX);
 }
 
-lua_sched_ctx* lua_sched_init(lua_State* L)
+lua_sched_ctx* lua_sched_init(lua_State* L,
+                              lua_sched_event* event,
+                              void* data)
 {
     lua_sched_ctx* ctx;
 
@@ -47,10 +57,11 @@ lua_sched_ctx* lua_sched_init(lua_State* L)
         DLOG("lua_sched_init: out of memory\n");
         return NULL;
     }
-
+    ctx->data = data;
     ctx->L = L;
     ctx->cur_co_ctx = NULL;
     ctx->posted_threads = NULL;
+    ctx->paused_threads = NULL;
     ctx->co_op = LUA_SCHED_USER_CORO_NOP;
     ctx->uthreads = 0;
     ctx->exited = 0;
@@ -61,8 +72,15 @@ lua_sched_ctx* lua_sched_init(lua_State* L)
         &ctx->entry_co_ctx.zombie_child_threads;
     ctx->entry_co_ctx.co_ref = LUA_NOREF;
     ctx->entry_co_ctx.co_status = LUA_SCHED_CO_SUSPENDED;
+    ctx->entry_co_ctx.co_entry = 1;
+    ctx->entry_co_ctx.index = ~0;
 
     ctx->co_ctx_bucket = list_ctor();
+
+    ctx->event.data = event->data;
+    ctx->event.create = event->create;
+    ctx->event.handler = lua_sched_sleep_resume;
+    lua_main_set(L, ctx);
     /* Initialize Lua registry for coroutines */
     lua_sched_init_registry(L);
 
@@ -72,9 +90,14 @@ lua_sched_ctx* lua_sched_init(lua_State* L)
     /* Inject coroutine and thread APIs */
     lua_sched_inject_coroutine_api(L);
     lua_sched_inject_thread_api(L);
+    lua_sched_inject_sleep_api(L);
 
     return ctx;
 }
+
+/* ============================================================================
+ * Scheduler Cleanup
+ * ============================================================================ */
 
 void lua_sched_cleanup(lua_sched_ctx* ctx)
 {
@@ -91,7 +114,11 @@ void lua_sched_cleanup(lua_sched_ctx* ctx)
         {
             lua_sched_co_ctx* node = list_entry(pos, lua_sched_co_ctx, link);
 
-            assert(node->co_ref == -2);
+            if (node->zombie_child_threads) {
+                lua_sched_cleanup_zombie_child_threads(ctx, node);
+            }
+
+            assert(node->co_ref == LUA_NOREF);
             DLOG("Freeing co_ctx node=%p, co_status=%d, co_ref=%d\n",
                  node, node->co_status, node->co_ref);
             free(node);
@@ -112,7 +139,7 @@ static int lua_sched_atpanic(lua_State* L)
 }
 
 /* ============================================================================
- * Thread Management
+ * Thread Management (Lua Threads)
  * ============================================================================ */
 
 lua_State* lua_sched_new_thread(lua_State* L, int* ref)
@@ -152,8 +179,158 @@ void lua_sched_del_thread(lua_State* L, int co_ref)
 }
 
 /* ============================================================================
- * Coroutine Context Management
+ * Pause/Resume Control
  * ============================================================================ */
+
+void lua_sched_pause(lua_sched_ctx* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+
+    DLOG("Pausing scheduler\n");
+    ctx->paused = 1;
+}
+
+void lua_sched_resume(lua_sched_ctx* ctx)
+{
+    lua_sched_posted_thread* pt;
+
+    if (ctx == NULL) {
+        return;
+    }
+
+    DLOG("Resuming scheduler\n");
+    ctx->paused = 0;
+
+    /* If there's a current coroutine that was suspended, mark it as running */
+    if (ctx->cur_co_ctx && ctx->cur_co_ctx->co_status == LUA_SCHED_CO_SUSPENDED) {
+        ctx->cur_co_ctx->co_status = LUA_SCHED_CO_RUNNING;
+    }
+
+    /* Move all paused threads back to posted_threads queue */
+    if (ctx->paused_threads) {
+        DLOG("Restoring %d paused threads to execution queue\n",
+             ctx->paused_threads ? 1 : 0);
+
+        /* Find the end of paused_threads list */
+        pt = ctx->paused_threads;
+        while (pt->next != NULL) {
+            pt = pt->next;
+        }
+
+        /* Append posted_threads to the end of paused_threads */
+        pt->next = ctx->posted_threads;
+
+        /* Make paused_threads the new posted_threads */
+        ctx->posted_threads = ctx->paused_threads;
+        ctx->paused_threads = NULL;
+
+        DLOG("All paused threads restored to execution queue\n");
+    }
+}
+
+int lua_sched_is_paused(lua_sched_ctx* ctx)
+{
+    if (ctx == NULL) {
+        return 0;
+    }
+
+    return ctx->paused;
+}
+
+/* ============================================================================
+ * Scheduler Exit/Stop Control
+ * ============================================================================ */
+
+void lua_sched_exit(lua_sched_ctx* ctx)
+{
+    ctx->exited = 1;
+}
+
+int lua_sched_stopped(lua_sched_ctx* ctx)
+{
+    return ctx->exited;
+}
+
+/* ============================================================================
+ * Queue Cleanup Functions
+ * ============================================================================ */
+
+void lua_sched_posted_threads_cleanup(lua_sched_ctx* ctx)
+{
+    lua_sched_posted_thread *prev, *pos, *n;
+    // 3. 清理 posted_threads 队列中的协程引用
+    slist_ptr_for_each_safe(ctx->posted_threads, prev, pos, n) {
+        if (pos->co_ctx && pos->co_ctx->co_ref != LUA_NOREF) {
+            lua_sched_del_co_ctx(ctx, pos->co_ctx);
+        }
+        free(pos);
+    }
+    ctx->posted_threads = NULL;
+}
+
+void lua_sched_paused_threads_cleanup(lua_sched_ctx* ctx)
+{
+    lua_sched_posted_thread *prev, *pos, *n;
+    // 3. 清理 posted_threads 队列中的协程引用
+    slist_ptr_for_each_safe(ctx->paused_threads, prev, pos, n) {
+        if (pos->co_ctx && pos->co_ctx->co_ref != LUA_NOREF) {
+            lua_sched_del_co_ctx(ctx, pos->co_ctx);
+        }
+        free(pos);
+    }
+    ctx->paused_threads = NULL;
+}
+
+void lua_sched_co_ctx_bucket_cleanup(lua_sched_ctx* ctx)
+{
+    if (ctx->co_ctx_bucket) {
+        struct list* pos, *next;
+        list_for_each_safe(pos, next, ctx->co_ctx_bucket) {
+            lua_sched_co_ctx* node = list_entry(pos, lua_sched_co_ctx, link);
+
+            // 清理僵尸子线程
+            if (node->zombie_child_threads) {
+                lua_sched_cleanup_zombie_child_threads(ctx, node);
+            }
+
+            // 释放协程引用
+            if (node->co_ref != LUA_NOREF) {
+                lua_sched_del_co_ctx(ctx, node);
+            }
+        }
+    }
+}
+
+
+void lua_sched_force_stop(lua_sched_ctx* ctx)
+{
+    if (ctx == NULL) return;
+
+    // 1. 设置退出标志
+    ctx->exited = 1;
+    ctx->paused = 1;
+
+    // 2. 清理当前协程
+    if (ctx->cur_co_ctx && ctx->cur_co_ctx != &ctx->entry_co_ctx) {
+        if (ctx->cur_co_ctx->co_ref != LUA_NOREF) {
+            lua_sched_del_co_ctx(ctx, ctx->cur_co_ctx);
+        }
+        ctx->cur_co_ctx = NULL;
+    }
+
+    // 3. 清理 posted_threads 队列中的协程引用
+    lua_sched_posted_threads_cleanup(ctx);
+    // 4. 清理 paused_threads 队列中的协程引用
+    lua_sched_paused_threads_cleanup(ctx);
+    // 5. 清理 bucket 中的所有用户协程
+    lua_sched_co_ctx_bucket_cleanup(ctx);
+    // 6. 清理 entry 协程
+    if (ctx->entry_co_ctx.co_ref != LUA_NOREF) {
+        lua_sched_del_co_ctx(ctx, &ctx->entry_co_ctx);
+    }
+}
 
 lua_sched_co_ctx* lua_sched_create_co_ctx(lua_sched_ctx* ctx)
 {
@@ -167,9 +344,13 @@ lua_sched_co_ctx* lua_sched_create_co_ctx(lua_sched_ctx* ctx)
     coctx->next_zombie_child_thread = &coctx->zombie_child_threads;
     coctx->co_ref = LUA_NOREF;
     coctx->co_status = LUA_SCHED_CO_SUSPENDED;
-    coctx->sleep = (lua_sched_co_sleep*)calloc(1, sizeof(lua_sched_co_sleep));
+    coctx->index = 0;
+    list_init(&coctx->link);
+    //coctx->sleep = (lua_sched_co_sleep*)calloc(1, sizeof(lua_sched_co_sleep));
 
     list_add(ctx->co_ctx_bucket, &coctx->link);
+
+    coctx->index = list_count_nodes(ctx->co_ctx_bucket);
 
     return coctx;
 }
@@ -209,10 +390,6 @@ void lua_sched_del_co_ctx_free(lua_sched_ctx* ctx, lua_sched_co_ctx* co_ctx)
     }
     /* Don't free entry_co_ctx as it's embedded in lua_sched_ctx */
     if (co_ctx != &ctx->entry_co_ctx) {
-        if (co_ctx->sleep) {
-            free(co_ctx->sleep);
-            co_ctx->sleep = NULL;
-        }
         free(co_ctx);
     }
 }
@@ -266,36 +443,32 @@ static int lua_sched_post_zombie_thread(lua_sched_co_ctx* parent,
     return 0;
 }
 
-static void lua_sched_cleanup_zombie_child_threads(lua_State* L,
-                                                   lua_sched_ctx* ctx,
+static void lua_sched_cleanup_zombie_child_threads(lua_sched_ctx* ctx,
                                                    lua_sched_co_ctx* coctx)
 {
-    lua_sched_posted_thread* pt;
-    lua_sched_posted_thread* next_pt;
     lua_sched_co_ctx* child_coctx;
+    lua_sched_posted_thread *prev, *pos, *n;
 
-    pt = coctx->zombie_child_threads;
-    coctx->zombie_child_threads = NULL;
-    coctx->next_zombie_child_thread = &coctx->zombie_child_threads;
-
-    while (pt) {
-        next_pt = pt->next;
-        child_coctx = pt->co_ctx;
+    slist_ptr_for_each_safe(coctx->zombie_child_threads, prev, pos, n) {
+        child_coctx = pos->co_ctx;
 
         if (child_coctx && child_coctx->co_ref != LUA_NOREF) {
             lua_sched_del_co_ctx(ctx, child_coctx);
             ctx->uthreads--;
         }
 
-        free(pt);
-        pt = next_pt;
+        free(pos);
     }
+
+    /* reset */
+    coctx->zombie_child_threads = NULL;
+    coctx->next_zombie_child_thread = &coctx->zombie_child_threads;
 }
 
 static void lua_sched_finalize_threads(lua_sched_ctx* ctx, lua_State* L)
 {
     lua_sched_co_ctx* coctx;
-
+    lua_sched_posted_thread* prev, *pos, *n;
     /* Clean up entry thread */
     coctx = &ctx->entry_co_ctx;
     if (coctx->co_ref != LUA_NOREF) {
@@ -303,14 +476,17 @@ static void lua_sched_finalize_threads(lua_sched_ctx* ctx, lua_State* L)
     }
 
     if (coctx->zombie_child_threads) {
-        lua_sched_cleanup_zombie_child_threads(L, ctx, coctx);
+        lua_sched_cleanup_zombie_child_threads(ctx, coctx);
     }
 
     /* Clear posted threads */
-    while (ctx->posted_threads) {
-        lua_sched_posted_thread* pt = ctx->posted_threads;
-        ctx->posted_threads = pt->next;
-        free(pt);
+    slist_ptr_for_each_safe(ctx->posted_threads, prev, pos, n) {
+        free(pos);
+    }
+
+    /* Clear paused threads */
+    slist_ptr_for_each_safe(ctx->paused_threads, prev, pos, n) {
+        free(pos);
     }
 }
 
@@ -380,10 +556,6 @@ int lua_sched_coroutine_create(lua_State* L, lua_sched_ctx* ctx,
     coctx->co = co;
     coctx->co_status = LUA_SCHED_CO_SUSPENDED;
 
-    if (ctx->create) {
-        ctx->create(coctx);
-    }
-
     /* Attach context to coroutine */
     lua_sched_attach_co_ctx_to_L(ctx->L, co, coctx);
 
@@ -413,7 +585,7 @@ int lua_sched_coroutine_create(lua_State* L, lua_sched_ctx* ctx,
  * Posted Thread Runner
  * ============================================================================ */
 
-static int lua_sched_run_posted_threads(lua_State* L, lua_sched_ctx* ctx)
+int lua_sched_run_posted_threads(lua_State* L, lua_sched_ctx* ctx)
 {
     lua_sched_posted_thread* pt;
     lua_sched_posted_thread* prev;
@@ -460,6 +632,9 @@ static int lua_sched_run_posted_threads(lua_State* L, lua_sched_ctx* ctx)
         if (rc == SCHED_AGAIN || rc == SCHED_DONE) {
             DLOG("  High priority thread yielded/finished, processing other threads\n");
             /* Fall through to normal processing */
+        } else if (rc == SCHED_PAUSED) {
+            DLOG("  Scheduler paused\n");
+            return rc;
         } else {
             return rc;
         }
@@ -516,15 +691,16 @@ static int lua_sched_run_posted_threads(lua_State* L, lua_sched_ctx* ctx)
 
         if (rc == SCHED_AGAIN || rc == SCHED_DONE) {
             continue;
+        } else if (rc == SCHED_PAUSED) {
+            DLOG("  Scheduler paused\n");
+            return rc;
+        } else {
+            return rc;
         }
 
         return rc;
     }
 }
-
-/* ============================================================================
- * Coroutine Operation Handlers
- * ============================================================================ */
 
 static int lua_sched_handle_coro_nop(lua_sched_ctx* ctx)
 {
@@ -726,10 +902,6 @@ static int lua_sched_handle_coroutine_operation(lua_State* L, lua_sched_ctx* ctx
     }
 }
 
-/* ============================================================================
- * Coroutine Completion Handlers
- * ============================================================================ */
-
 static int lua_sched_handle_entry_thread_done(lua_sched_ctx* ctx, lua_State* L)
 {
     lua_settop(L, 0);
@@ -877,7 +1049,7 @@ static int lua_sched_handle_coroutine_success(lua_sched_ctx* ctx, lua_State* L, 
     ctx->cur_co_ctx->co_status = LUA_SCHED_CO_DEAD;
 
     if (ctx->cur_co_ctx->zombie_child_threads) {
-        lua_sched_cleanup_zombie_child_threads(L, ctx, ctx->cur_co_ctx);
+        lua_sched_cleanup_zombie_child_threads(ctx, ctx->cur_co_ctx);
     }
 
     if (lua_sched_is_entry_thread(ctx)) {
@@ -1030,10 +1202,6 @@ static int lua_sched_handle_coroutine_error(lua_sched_ctx* ctx, lua_State* L,
     return lua_sched_handle_user_coroutine_error(ctx, orig_coctx, nrets);
 }
 
-/* ============================================================================
- * Main Thread Runner
- * ============================================================================ */
-
 int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
 {
     lua_sched_co_ctx* orig_coctx;
@@ -1050,6 +1218,13 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
         return SCHED_ERROR;
     }
 
+    /* Check if scheduler is paused */
+    if (ctx->paused) {
+        DLOG("Scheduler is paused, suspending coroutine\n");
+        ctx->cur_co_ctx->co_status = LUA_SCHED_CO_SUSPENDED;
+        return SCHED_PAUSED;
+    }
+
     if (ctx->cur_co_ctx->thread_spawn_yielded) {
         ctx->cur_co_ctx->thread_spawn_yielded = 0;
         nrets = 1;
@@ -1061,12 +1236,21 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
     }
 
     while (1) {
+        if (ctx->paused) {
+            DLOG("Scheduler paused during execution\n");
+            ctx->cur_co_ctx->co_status = LUA_SCHED_CO_SUSPENDED;
+            return SCHED_PAUSED;
+        }
         orig_coctx = ctx->cur_co_ctx;
 
         if (orig_coctx->propagate_error) {
             orig_coctx->propagate_error = 0;
             return lua_sched_handle_coroutine_error(ctx, L, orig_coctx, err, msg, &nrets);
         }
+
+        /* Save resume context before calling lua_resume */
+        orig_coctx->resume_from = L;
+        orig_coctx->resume_nargs = nrets;
 
         /* Resume the coroutine */
         rv = lua_resume(orig_coctx->co, L, nrets, &nrets);
@@ -1077,7 +1261,7 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
 
                 if (ctx->exited) {
                     ctx->cur_co_ctx = NULL;
-                    return 0;
+                    return SCHED_DONE;
                 }
 
                 result = lua_sched_handle_coroutine_operation(L, ctx, &nrets);
@@ -1104,17 +1288,14 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
             case LUA_ERRSYNTAX:
                 err = "syntax error";
                 break;
-
             case LUA_ERRMEM:
                 err = "memory allocation error";
                 DLOG("[lua] %s\n", err);
                 abort();
                 break;
-
             case LUA_ERRERR:
                 err = "error handler error";
                 break;
-
             default:
                 err = "unknown error";
                 break;
@@ -1131,10 +1312,6 @@ int lua_sched_run_thread(lua_sched_ctx* ctx, int nrets)
 
     return result;
 }
-
-/* ============================================================================
- * Script Runners
- * ============================================================================ */
 
 int lua_sched_run_file(lua_sched_ctx* ctx, const char* filename)
 {
@@ -1169,6 +1346,9 @@ int lua_sched_run_file(lua_sched_ctx* ctx, const char* filename)
 
     if (rc == SCHED_AGAIN) {
         rc = lua_sched_run_posted_threads(L, ctx);
+    } else if (rc == SCHED_PAUSED) {
+        /* Keep SCHED_PAUSED status */
+        return rc;
     }
 
     return rc;
@@ -1203,19 +1383,62 @@ int lua_sched_run_string(lua_sched_ctx* ctx, const char* script,
 
     lua_sched_attach_co_ctx_to_L(L, co, ctx->cur_co_ctx);
 
-    while (1) {
-        rc = lua_sched_run_thread(ctx, 0);
+    rc = lua_sched_run_thread(ctx, 0);
 
-        if (rc == SCHED_AGAIN) {
-            int pt_rc = lua_sched_run_posted_threads(L, ctx);
-            if (pt_rc != 0 && pt_rc != SCHED_AGAIN) {
-                return pt_rc;
-            }
-            continue;
-        }
-
-        break;
+    if (rc == SCHED_AGAIN) {
+        rc = lua_sched_run_posted_threads(L, ctx);
     }
 
     return rc;
+}
+
+/* ============================================================================
+ * Resume Context Access
+ * ============================================================================ */
+
+lua_State* lua_sched_get_resume_from(lua_sched_co_ctx* co_ctx)
+{
+    if (co_ctx == NULL) {
+        return NULL;
+    }
+    return co_ctx->resume_from;
+}
+
+int lua_sched_get_resume_nargs(lua_sched_co_ctx* co_ctx)
+{
+    if (co_ctx == NULL) {
+        return 0;
+    }
+    return co_ctx->resume_nargs;
+}
+
+lua_sched_co_ctx* lua_sched_find_co_ctx(lua_sched_ctx* ctx, lua_State* L)
+{
+    struct list* pos;
+
+    if (ctx == NULL || L == NULL) {
+        return NULL;
+    }
+
+    /* Check if it's the entry coroutine */
+    if (ctx->entry_co_ctx.co == L) {
+        return &ctx->entry_co_ctx;
+    }
+
+    /* Check current coroutine */
+    if (ctx->cur_co_ctx && ctx->cur_co_ctx->co == L) {
+        return ctx->cur_co_ctx;
+    }
+
+    /* Search through coroutine bucket */
+    if (ctx->co_ctx_bucket) {
+        list_for_each(pos, ctx->co_ctx_bucket) {
+            lua_sched_co_ctx* co_ctx = list_entry(pos, lua_sched_co_ctx, link);
+            if (co_ctx->co == L) {
+                return co_ctx;
+            }
+        }
+    }
+
+    return NULL;
 }
